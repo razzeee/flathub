@@ -8,6 +8,10 @@ fi
 report_dir="$GITHUB_WORKSPACE/checker-health"
 mkdir -p "$report_dir" || exit 1
 
+record_status() {
+    python3 /health.py record "$report_dir" "$@" || exit 1
+}
+
 git config --global user.name "flathubbot" && \
 git config --global user.email "sysadmin@flathub.org"
 
@@ -100,6 +104,7 @@ else
 fi
 
 echo "==> Cloning ${#repos[@]} repos"
+printf '%s\n' "${repos[@]}" | python3 /health.py start "$report_dir" || exit 1
 if ((${#repos[@]})); then
     printf '%s\n' "${repos[@]}" | \
         parallel -j8 "git clone --quiet --depth 1 https://github.com/flathub/{}"
@@ -109,9 +114,13 @@ checker_apps=()
 for repo in "${repos[@]}"; do
     if [[ ! -d "$repo" ]]; then
         echo "Failed to clone $repo" >&2
+        record_status "$repo" clone_failed
         continue
     fi
-    grep -rqE --exclude-dir=.git 'extra-data|x-checker-data|\.AppImage' "$repo" || continue
+    if ! grep -rqE --exclude-dir=.git 'extra-data|x-checker-data|\.AppImage' "$repo"; then
+        record_status "$repo" no_checker_metadata
+        continue
+    fi
     checker_apps+=("$repo")
 done
 
@@ -125,10 +134,12 @@ for repo in "${checker_apps[@]}"; do
     if [[ -f $repo/flathub.json ]]; then
         # check if repo opted out
         if ! jq -e '."disable-external-data-checker" | not' < "$repo"/flathub.json > /dev/null; then
+            record_status "$repo" disabled
             continue
         fi
         # check if the app is EOL
         if ! jq -e '."end-of-life" or ."end-of-life-rebase" | not' < "$repo"/flathub.json > /dev/null; then
+            record_status "$repo" end_of_life
             continue
         fi
         # add repo-specified f-e-d-c args
@@ -148,16 +159,19 @@ for repo in "${checker_apps[@]}"; do
     elif [[ -f $repo/${repo}.json ]]; then
         manifest=${repo}.json
     else
+        record_status "$repo" manifest_not_found
         continue
     fi
 
     echo "==> checking ${repo}"
     ((checked_apps += 1))
+    record_status "$repo" checking
     if /app/flatpak-external-data-checker --verbose --update --report-json "$report_dir/$repo.json" "${FEDC_OPTS[@]}" "$repo/$manifest"; then
         status=0
     else
         status=$?
     fi
+    record_status "$repo" finished "$status"
     # FEDC uses a bitmask: 1 = errors, 2 = outdated with --check-outdated.
     # Outdated-only is not a failure; unknown codes and signals are failures.
     case "$status" in

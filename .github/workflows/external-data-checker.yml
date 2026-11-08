@@ -16,6 +16,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   flathub-data-checker-global:
@@ -30,6 +31,13 @@ jobs:
       - name: Prepare health report directory
         run: mkdir -p checker-health
 
+      - name: Restore checker health history
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/actions/flatpak-external-data-checker/health.py restore checker-health
+
       - uses: ./.github/actions/flatpak-external-data-checker
         timeout-minutes: 210
         env:
@@ -41,6 +49,12 @@ jobs:
         run: |
           mkdir -p checker-health
           sudo chown -R "$(id -u):$(id -g)" checker-health
+
+      - name: Summarize checker health
+        if: always()
+        run: |
+          python3 .github/actions/flatpak-external-data-checker/health.py summarize checker-health
+          cat checker-health/summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Retain checker health reports
         if: always()

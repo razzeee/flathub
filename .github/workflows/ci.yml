@@ -35,3 +35,6 @@ jobs:
 
       - name: Lint
         run: find .github -name *.py -exec ruff check --output-format=github {} \;
+
+      - name: Test checker health reports
+        run: python3 -m unittest discover -s .github/actions/flatpak-external-data-checker -p 'test_*.py'

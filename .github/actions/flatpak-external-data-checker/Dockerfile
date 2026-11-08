@@ -6,5 +6,6 @@ RUN apt-get update && \
 
 ADD gh-ls-org /usr/local/bin/gh-ls-org
 ADD entrypoint.sh /entrypoint.sh
+ADD health.py /health.py
 
 ENTRYPOINT ["/entrypoint.sh"]
