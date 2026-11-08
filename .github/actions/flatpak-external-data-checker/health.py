@@ -41,7 +41,7 @@ def submodules(path, *source):
     ]
 
 
-def start(directory, selected):
+def start(directory, selected, skipped=None):
     directory.mkdir(parents=True, exist_ok=True)
     write_json(
         directory / "coverage.json",
@@ -59,6 +59,7 @@ def start(directory, selected):
             "shard_count": 6,
             "uninitialized_submodules": "excluded",
             "selected": selected,
+            "skipped": skipped or {},
         },
     )
 
@@ -95,11 +96,18 @@ def record(directory, repo, status, exit_code=None):
 def restore(directory):
     repository = os.environ["GITHUB_REPOSITORY"]
     current_run = int(os.environ["GITHUB_RUN_ID"])
-    artifacts = json.loads(
+    pages = json.loads(
         subprocess.check_output(
-            ["gh", "api", f"repos/{repository}/actions/artifacts?per_page=100"]
+            [
+                "gh",
+                "api",
+                "--paginate",
+                "--slurp",
+                f"repos/{repository}/actions/artifacts?per_page=100",
+            ]
         )
-    )["artifacts"]
+    )
+    artifacts = [artifact for page in pages for artifact in page["artifacts"]]
     candidates = sorted(
         (
             a
@@ -154,6 +162,17 @@ def findings(repo, report, context):
     source_errors = set()
     ignored = 0
     branch = report.get("branch") or context.get("branch", "")
+
+    def add_failure(location, category, message):
+        key = observation_key(repo, branch, location, category)
+        failures[key] = {
+            "repository": repo,
+            "branch": branch,
+            "location": location,
+            "category": category,
+            "message": message,
+        }
+
     for source in report.get("sources", []):
         location = f"{source['manifest']}#{source['source_pointer']}"
         status = source.get("status")
@@ -176,14 +195,7 @@ def findings(repo, report, context):
                 }
             ]
         for error in errors:
-            key = observation_key(repo, branch, location, error["type"])
-            failures[key] = {
-                "repository": repo,
-                "branch": branch,
-                "location": location,
-                "category": error["type"],
-                "message": error["message"],
-            }
+            add_failure(location, error["type"], error["message"])
     for error in report.get("errors", []):
         if (error.get("type"), error.get("message")) in source_errors:
             continue
@@ -199,32 +211,11 @@ def findings(repo, report, context):
         )
         digest = hashlib.sha256(message.encode()).hexdigest()[:16]
         location = "run:" + digest
-        key = observation_key(repo, branch, location, error["type"])
-        failures[key] = {
-            "repository": repo,
-            "branch": branch,
-            "location": location,
-            "category": error["type"],
-            "message": error["message"],
-        }
+        add_failure(location, error["type"], error["message"])
     if report.get("delivery") == "failed" and not failures:
-        key = observation_key(repo, branch, "delivery", "DeliveryFailed")
-        failures[key] = {
-            "repository": repo,
-            "branch": branch,
-            "location": "delivery",
-            "category": "DeliveryFailed",
-            "message": "Update delivery failed",
-        }
+        add_failure("delivery", "DeliveryFailed", "Update delivery failed")
     if report.get("status") == "failed" and not failures and not ignored:
-        key = observation_key(repo, branch, "run:unknown", "RunFailed")
-        failures[key] = {
-            "repository": repo,
-            "branch": branch,
-            "location": "run:unknown",
-            "category": "RunFailed",
-            "message": "Check failed without diagnostics",
-        }
+        add_failure("run:unknown", "RunFailed", "Check failed without diagnostics")
     return failures, checked, ignored
 
 
@@ -241,6 +232,12 @@ def summarize(directory):
         else {"status": "unavailable"}
     )
     contexts = {repo: {"status": "selected"} for repo in coverage["selected"]}
+    contexts.update(
+        {
+            repo: {"status": status}
+            for repo, status in coverage.get("skipped", {}).items()
+        }
+    )
     events = directory / "coverage.jsonl"
     if events.exists():
         for line in events.read_text().splitlines():
@@ -251,10 +248,12 @@ def summarize(directory):
     missing = []
     ignored = 0
     for repo, context in contexts.items():
+        if context["status"] == "outside_shard":
+            continue
         repository = repositories.setdefault(repo, {})
-        repository.update(
-            {"last_selected": coverage["started_at"], "status": context["status"]}
-        )
+        repository["status"] = context["status"]
+        if repo in coverage["selected"]:
+            repository["last_selected"] = coverage["started_at"]
         if context["status"] not in ("checking", "finished"):
             if context["status"] in ("selected", "clone_failed"):
                 missing.append(repo)
@@ -359,7 +358,7 @@ def summarize(directory):
     lines = [
         "## Checker health",
         "",
-        f"Selected repositories: {len(contexts)}.",
+        f"Selected repositories: {len(coverage['selected'])}.",
         f"Missing reports or failed clones: {len(missing)}.",
         f"Missing-file errors in excluded submodules: {ignored}.",
         "",
@@ -407,7 +406,17 @@ def main():
     parser.add_argument("exit_code", nargs="?", type=int)
     args = parser.parse_args()
     if args.command == "start":
-        start(args.directory, [repo for repo in sys.stdin.read().splitlines() if repo])
+        selected = []
+        skipped = {}
+        for line in sys.stdin.read().splitlines():
+            if not line:
+                continue
+            repo, separator, reason = line.partition("\t")
+            if separator:
+                skipped[repo] = reason
+            else:
+                selected.append(repo)
+        start(args.directory, selected, skipped)
     elif args.command == "record":
         record(args.directory, args.repo, args.status, args.exit_code)
     elif args.command == "restore":

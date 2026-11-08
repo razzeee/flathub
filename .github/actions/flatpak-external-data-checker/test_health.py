@@ -153,7 +153,11 @@ class HealthTests(unittest.TestCase):
         first = self.run_reports({"app": self.report("checked")})
         state = self.load(first)
         state["repositories"]["app"]["last_checked"] = "2020-01-01T00:00:00+00:00"
-        second = self.run_reports({"other": self.report("checked")}, state)
+        second = self.run_reports(
+            {"app": None, "other": self.report("checked")},
+            state,
+            statuses={"app": "outside_shard"},
+        )
         self.assertEqual(
             self.load(second, "triage.json")["not_checked_in_48_hours"], ["app"]
         )
@@ -190,7 +194,7 @@ class HealthTests(unittest.TestCase):
             health.subprocess,
             "check_output",
             side_effect=[
-                json.dumps({"artifacts": artifacts}).encode(),
+                json.dumps([{"artifacts": artifacts}]).encode(),
                 data.getvalue(),
             ],
         ) as run:
@@ -264,6 +268,102 @@ class HealthTests(unittest.TestCase):
             ],
             2,
         )
+
+    def test_restore_finds_history_after_first_artifact_page(self):
+        unrelated = [{"id": i, "name": "other-artifact"} for i in range(100)]
+        artifact = {
+            "id": 101,
+            "name": "checker-health-98-1",
+            "expired": False,
+            "workflow_run": {"id": 98, "head_branch": "master"},
+        }
+        state = {"schema_version": 1, "failures": {"old": {"consecutive_checks": 2}}}
+        archive_data = io.BytesIO()
+        with zipfile.ZipFile(archive_data, "w") as archive:
+            archive.writestr("health-state.json", json.dumps(state))
+
+        def request(command):
+            if command[-1].endswith("/101/zip"):
+                return archive_data.getvalue()
+            pages = [
+                {"total_count": 101, "artifacts": unrelated},
+                {"total_count": 101, "artifacts": [artifact]},
+            ]
+            if "--paginate" in command and "--slurp" in command:
+                return json.dumps(pages).encode()
+            return json.dumps(pages[0]).encode()
+
+        with patch.object(health.subprocess, "check_output", side_effect=request):
+            health.restore(self.root)
+        self.assertEqual(self.load(self.root, "previous-state.json"), state)
+
+    def test_selection_exclusions_are_recorded(self):
+        names = [f"app{i}" for i in range(20)]
+        checksums = {
+            name: int(
+                subprocess.check_output(["cksum"], input=name.encode()).split()[0]
+            )
+            for name in names
+        }
+        selected = next(name for name in names if checksums[name] % 6 == 0)
+        outside = next(name for name in names if checksums[name] % 6 != 0)
+        listing = self.root / "repos.json"
+        listing.write_text(
+            json.dumps(
+                [
+                    {"name": name, "archived": name == "archived", "private": False}
+                    for name in (selected, outside, "archived", "inactive")
+                ]
+            )
+        )
+        environment = self.root / "environment.sh"
+        environment.write_text("""
+git() { return 0; }
+sleep() { return 0; }
+curl() {
+    while [[ "$1" != --output ]]; do shift; done
+    printf 'inactive\\n' > "$2"
+}
+gh() {
+    if [[ "$*" == *search/code* ]]; then
+        printf '{"incomplete_results":false,"total_count":0,"items":[]}\\n'
+    elif [[ "$*" == *orgs/flathub/repos* ]]; then
+        command jq -r "${@: -1}" "$REPO_LISTING"
+    else
+        printf 'selected\\n'
+    fi
+}
+parallel() { while read -r repo; do mkdir -p "$repo"; done; }
+python3() { command "$PYTHON" "$HEALTH_SCRIPT" "${@:2}"; }
+""")
+        for target in ("", "inactive"):
+            with self.subTest(target=target):
+                workspace = self.root / (target or "global")
+                workspace.mkdir()
+                script = Path(health.__file__).with_name("entrypoint.sh")
+                env = {
+                    **os.environ,
+                    "GITHUB_WORKSPACE": str(workspace),
+                    "APP_ID": target,
+                    "BASH_ENV": str(environment),
+                    "REPO_LISTING": str(listing),
+                    "PYTHON": os.sys.executable,
+                    "HEALTH_SCRIPT": health.__file__,
+                }
+                subprocess.run(
+                    ["bash", str(script)],
+                    cwd=workspace,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                coverage = self.load(workspace / "checker-health", "coverage.json")
+                self.assertEqual(coverage["skipped"]["inactive"], "inactive")
+                if not target:
+                    self.assertEqual(coverage["selected"], [selected])
+                    self.assertEqual(coverage["skipped"]["archived"], "archived")
+                    self.assertEqual(coverage["skipped"][outside], "outside_shard")
 
 
 if __name__ == "__main__":

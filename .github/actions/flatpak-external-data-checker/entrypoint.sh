@@ -49,14 +49,21 @@ valid_repo_name() {
 }
 
 repos=()
+selection_skips=()
 if [[ -n "${APP_ID:-}" ]]; then
     if ! valid_repo_name "$APP_ID"; then
         echo "Invalid application ID" >&2
         exit 1
     fi
-    if [[ -z "${inactive_repos[$APP_ID]:-}" ]]; then
-        active=$(gh api "repos/flathub/$APP_ID" --jq '.archived == false and .private == false') || exit 1
-        [[ "$active" == true ]] && repos+=("$APP_ID")
+    if [[ -n "${inactive_repos[$APP_ID]:-}" ]]; then
+        selection_skips+=("$APP_ID"$'\t'inactive)
+    else
+        disposition=$(gh api "repos/flathub/$APP_ID" --jq 'if .private then "private" elif .archived then "archived" else "selected" end') || exit 1
+        if [[ "$disposition" == selected ]]; then
+            repos+=("$APP_ID")
+        else
+            selection_skips+=("$APP_ID"$'\t'"$disposition")
+        fi
     fi
 else
     shard=$(((GITHUB_RUN_NUMBER - 1) % 6))
@@ -90,21 +97,34 @@ else
 
     echo "==> Listing repos for shard $shard/6"
     org_repos=$(gh api --paginate "orgs/flathub/repos?type=public&per_page=100" \
-        --jq '.[] | select(.archived == false and .private == false) | .name') || exit 1
-    while IFS= read -r repo; do
+        --jq '.[] | [.name, (if .private then "private" elif .archived then "archived" else "selected" end)] | @tsv') || exit 1
+    while IFS=$'\t' read -r repo disposition; do
         valid_repo_name "$repo" || continue
-        [[ -z "${inactive_repos[$repo]:-}" ]] || continue
+        if [[ "$disposition" != selected ]]; then
+            selection_skips+=("$repo"$'\t'"$disposition")
+            continue
+        fi
+        if [[ -n "${inactive_repos[$repo]:-}" ]]; then
+            selection_skips+=("$repo"$'\t'inactive)
+            continue
+        fi
         if [[ -z "${extra_data_repos[$repo]:-}" ]]; then
             checksum=$(printf '%s' "$repo" | cksum)
             checksum=${checksum%% *}
-            ((checksum % 6 == shard)) || continue
+            if ((checksum % 6 != shard)); then
+                selection_skips+=("$repo"$'\t'outside_shard)
+                continue
+            fi
         fi
         repos+=("$repo")
     done <<< "$org_repos"
 fi
 
 echo "==> Cloning ${#repos[@]} repos"
-printf '%s\n' "${repos[@]}" | python3 /health.py start "$report_dir" || exit 1
+{
+    printf '%s\n' "${repos[@]}"
+    printf '%s\n' "${selection_skips[@]}"
+} | python3 /health.py start "$report_dir" || exit 1
 if ((${#repos[@]})); then
     printf '%s\n' "${repos[@]}" | \
         parallel -j8 "git clone --quiet --depth 1 https://github.com/flathub/{}"
